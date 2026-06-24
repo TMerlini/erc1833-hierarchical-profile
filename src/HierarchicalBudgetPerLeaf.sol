@@ -66,31 +66,39 @@ contract HierarchicalBudgetPerLeaf is IBoundedAgentAction {
 
     constructor(IReceiptVerifier verifier_) { verifier = verifier_; }
 
-    /// Register the mandate's capability commitment (fixed). `capRoot` commits to / equals the 8001 agreementHash.
+    /// ⚠️ LAYER-1 SEAM (TODO, babyblueviper1) — NOT load-bearing yet. `capRoot` MUST equal the agreementHash
+    /// of an *accepted* ERC-8001 mandate the registrant can prove, bound to its ERC-8004 identity. This stub
+    /// is permissionless and takes the root ON FAITH — so anyone can `register(id, anyRoot)` and bounded
+    /// authority would be self-asserted, a hole in the no-trusted-party property at layer 1. Authenticating
+    /// the id<->capRoot binding to the 8001 acceptance is the layer-1 seam onto the witness; do not use as-is.
     function register(bytes32 id, bytes32 capRoot) external {
         if (capabilityRoot[id] != bytes32(0)) revert AlreadyRegistered();
-        capabilityRoot[id] = capRoot;
+        capabilityRoot[id] = capRoot; // TODO(layer-1): require proof capRoot == accepted 8001 agreementHash (8004-bound)
     }
 
     function advanceCursor(bytes32 id, bytes calldata witnessBytes) external override {
         AdvanceWitness memory w = abi.decode(witnessBytes, (AdvanceWitness));
 
-        // (1) AUTHORIZATION — ERC-8274 verdict, bound to THIS draw (recomputes against OCP/8281, not a store).
+        // Cheap reads first, the BIP-340 verify last — all checks are reads, effects are at the end (CEI),
+        // so a failed draw never pays for a verify. Order: draw-once -> cap membership -> headroom -> verdict.
+
+        // (1) DRAW-ONCE — per-leaf, namespaced (settlement uses keccak(receiptId,"settle") in the same registry).
+        bytes32 drawKey = keccak256(abi.encode(id, w.leaf.scopeId, w.receiptId, "draw"));
+        if (nullified[drawKey]) revert Replay();
+
+        // (2) CAP MEMBERSHIP — static tree only.
+        if (!_inRoot(_leafHash(w.leaf), w.capProof, capabilityRoot[id])) revert LeafNotInRoot();
+
+        // (3) HEADROOM — current spent read ON-CHAIN from the per-leaf slot (no caller proof, no global root).
+        uint256 spent = _spent[id][w.leaf.scopeId];
+        if (spent + w.amount > w.leaf.subCap) revert ExceedsSubCap();
+
+        // (4) AUTHORIZATION (last — the only expensive check) — ERC-8274 verdict bound to THIS draw,
+        //     recomputed against the OCP/8281 commitment (no private store, no trusted issuer).
         bytes32 actionHash = keccak256(abi.encode(id, w.leaf.scopeId, w.receiptId, w.amount));
         (bool valid, bool matches) = verifier.verify(actionHash, w.receiptProof);
         if (!valid) revert WitnessInvalid();
         if (!matches) revert ArtifactMismatch();
-
-        // (2) DRAW-ONCE — per-leaf, namespaced (settlement uses keccak(receiptId,"settle") in the same registry).
-        bytes32 drawKey = keccak256(abi.encode(id, w.leaf.scopeId, w.receiptId, "draw"));
-        if (nullified[drawKey]) revert Replay();
-
-        // (3) CAP MEMBERSHIP — static tree only.
-        if (!_inRoot(_leafHash(w.leaf), w.capProof, capabilityRoot[id])) revert LeafNotInRoot();
-
-        // (4) HEADROOM — current spent read ON-CHAIN from the per-leaf slot (no caller proof, no global root).
-        uint256 spent = _spent[id][w.leaf.scopeId];
-        if (spent + w.amount > w.leaf.subCap) revert ExceedsSubCap();
 
         // --- effects (CEI): per-leaf slot + nullifier + derived accumulator ---
         uint256 newSpent = spent + w.amount;
@@ -104,6 +112,11 @@ contract HierarchicalBudgetPerLeaf is IBoundedAgentAction {
     }
 
     // --- views: per-leaf spend is the gating state, recomputable from LeafAdvanced events ---
+
+    /// NON-AUTHORITATIVE history view. `_cursor = keccak(prev, scopeId, newSpent, receiptId)` is order-dependent
+    /// and exists only to give the 1833 base interface a `bytes32` handle. The authoritative, order-independent
+    /// state is per-leaf `leafSpent` (recomputable from `LeafAdvanced`). Downstream MUST NOT treat the exact
+    /// `getCursor` value as canonical — it's a history accumulator, not the budget.
     function getCursor(bytes32 id) external view override returns (bytes32) { return _cursor[id]; }
     function leafSpent(bytes32 id, bytes32 scopeId) external view returns (uint256) { return _spent[id][scopeId]; }
     function leafRemaining(bytes32 id, bytes32 scopeId, uint256 subCap) external view returns (uint256) {
