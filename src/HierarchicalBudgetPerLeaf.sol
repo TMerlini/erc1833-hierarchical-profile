@@ -20,7 +20,7 @@ pragma solidity ^0.8.24;
 ///  4. Only `capabilityRoot` is a maintained tree (static, OZ sorted-pair). `getCursor()` is a derived
 ///     history accumulator — per-leaf spend is the *gating* state and is recomputable from `LeafAdvanced`.
 ///
-/// What stays identical to the gist: the leaf hash `keccak(scopeId, subCap, asset)`, capabilityRoot
+/// From the gist (leaf hash now extends `keccak(scopeId, subCap, asset)` with a per-leaf pinned `issuer`): capabilityRoot
 /// commits to the ERC-8001 agreementHash, the witness is the same ERC-8274 verdict the escrow consumes,
 /// and the gate is multi-condition (valid ∧ matches ∧ in-root ∧ within-subcap ∧ unspent) — never on
 /// `valid` alone, replay-nullified.
@@ -38,7 +38,10 @@ interface IReceiptVerifier {
 }
 
 contract HierarchicalBudgetPerLeaf is IBoundedAgentAction {
-    struct Leaf { bytes32 scopeId; uint256 subCap; address asset; }
+    /// `issuer` = the per-leaf pinned authorizing key (x-only BIP340 pubkey), committed INTO
+    /// capabilityRoot via the leaf hash. A verify leg checks the draw signature against THIS leaf's
+    /// issuer (membership-proven), so authority is recomputable with no registry lookup at verify-time.
+    struct Leaf { bytes32 scopeId; uint256 subCap; address asset; bytes32 issuer; }
 
     /// No `leafSpent`, no `cursorProof` — bound to (id, scopeId, receiptId, amount), gate reads spent.
     struct AdvanceWitness {
@@ -93,10 +96,10 @@ contract HierarchicalBudgetPerLeaf is IBoundedAgentAction {
         uint256 spent = _spent[id][w.leaf.scopeId];
         if (spent + w.amount > w.leaf.subCap) revert ExceedsSubCap();
 
-        // (4) AUTHORIZATION (last — the only expensive check) — ERC-8274 verdict bound to THIS draw,
-        //     recomputed against the OCP/8281 commitment (no private store, no trusted issuer).
-        bytes32 actionHash = keccak256(abi.encode(id, w.leaf.scopeId, w.receiptId, w.amount));
-        (bool valid, bool matches) = verifier.verify(actionHash, w.receiptProof);
+        // (4) AUTHORIZATION (last — the only expensive check) — the draw verdict bound to THIS draw,
+        //     recomputed against the commitment. Pluggable via _verifyDraw so a profile can swap the
+        //     binding/verifier without touching the gate above (CEI: runs after draw-once/membership/headroom).
+        (bool valid, bool matches) = _verifyDraw(id, w);
         if (!valid) revert WitnessInvalid();
         if (!matches) revert ArtifactMismatch();
 
@@ -109,6 +112,19 @@ contract HierarchicalBudgetPerLeaf is IBoundedAgentAction {
         _cursor[id] = next;
         emit LeafAdvanced(id, w.leaf.scopeId, newSpent, w.receiptId, w.amount);
         emit EnvelopeAdvanced(id, prev, next);
+    }
+
+    /// Draw authorization (gate step 4), PLUGGABLE. DEFAULT: ERC-8274 receipt verify over the keccak
+    /// action-hash, recomputed against the OCP/8281 commitment — no private store, no trusted issuer.
+    /// `virtual` so a profile (e.g. a GhostAgent spend-witness on Gnosis) overrides the binding —
+    /// e.g. sha256(preimage) + the per-leaf pinned issuer `w.leaf.issuer` — adding ONLY this verify leg.
+    /// Runs LAST under CEI, so an override changes HOW the verdict is checked, never the
+    /// draw-once / membership / headroom gate that precedes it.
+    function _verifyDraw(bytes32 id, AdvanceWitness memory w)
+        internal view virtual returns (bool valid, bool matches)
+    {
+        bytes32 actionHash = keccak256(abi.encode(id, w.leaf.scopeId, w.receiptId, w.amount));
+        return verifier.verify(actionHash, w.receiptProof);
     }
 
     // --- views: per-leaf spend is the gating state, recomputable from LeafAdvanced events ---
@@ -125,7 +141,7 @@ contract HierarchicalBudgetPerLeaf is IBoundedAgentAction {
     }
 
     function _leafHash(Leaf memory l) internal pure returns (bytes32) {
-        return keccak256(abi.encode(l.scopeId, l.subCap, l.asset)); // identical to the gist's leafHash
+        return keccak256(abi.encode(l.scopeId, l.subCap, l.asset, l.issuer)); // gist leaf + per-leaf pinned issuer
     }
 
     /// OZ-style sorted-pair merkle proof — boring on purpose, recomputable off-chain.
