@@ -37,6 +37,16 @@ interface IReceiptVerifier {
         external view returns (bool valid, bool artifactHashMatches);
 }
 
+/// ERC-8001 agreement registry (injected). The capability commitment is NOT asserted by the
+/// registrant — it is pulled from an agreement the agent actually accepted, so `capabilityRoot`
+/// can only ever be the authority the mandate granted. This is the layer-1 seam: 8004 identity +
+/// accepted 8001 mandate, recomputable, no self-assertion.
+interface IAgreementRegistry {
+    /// @return agent   the 8004-bound identity that accepted `agreementHash` (address(0) if none)
+    /// @return capRoot the capability tree the accepted agreement commits to (bytes32(0) if none)
+    function acceptance(bytes32 agreementHash) external view returns (address agent, bytes32 capRoot);
+}
+
 contract HierarchicalBudgetPerLeaf is IBoundedAgentAction {
     struct Leaf { bytes32 scopeId; uint256 subCap; address asset; }
 
@@ -50,12 +60,14 @@ contract HierarchicalBudgetPerLeaf is IBoundedAgentAction {
     }
 
     IReceiptVerifier public immutable verifier;                 // ERC-8274
-    mapping(bytes32 => bytes32) public capabilityRoot;          // id => static merkle{leafHash} (== 8001 agreementHash)
+    IAgreementRegistry public immutable agreements;             // ERC-8001 (layer-1 source of capRoot)
+    mapping(bytes32 => bytes32) public capabilityRoot;          // id => static merkle{leafHash} (from accepted 8001 mandate)
     mapping(bytes32 => bytes32) private _cursor;                // id => derived history accumulator
     mapping(bytes32 => mapping(bytes32 => uint256)) private _spent; // id => scopeId => spent  (PER-LEAF slots)
     mapping(bytes32 => bool) public nullified;                  // namespaced draw/settle keys
 
     event LeafAdvanced(bytes32 indexed id, bytes32 indexed scopeId, uint256 newSpent, bytes32 receiptId, uint256 amount);
+    event Registered(bytes32 indexed id, bytes32 indexed agreementHash, bytes32 capRoot, address agent);
 
     error AlreadyRegistered();
     error WitnessInvalid();
@@ -63,17 +75,28 @@ contract HierarchicalBudgetPerLeaf is IBoundedAgentAction {
     error Replay();
     error LeafNotInRoot();
     error ExceedsSubCap();
+    error AgreementNotAccepted();   // ERC-8001: this mandate was never accepted
+    error NotMandateAgent();        // ERC-8004: registrant is not the agent that accepted it
+    error EmptyCapRoot();           // the accepted agreement commits to no capability tree
 
-    constructor(IReceiptVerifier verifier_) { verifier = verifier_; }
+    constructor(IReceiptVerifier verifier_, IAgreementRegistry agreements_) {
+        verifier = verifier_;
+        agreements = agreements_;
+    }
 
-    /// ⚠️ LAYER-1 SEAM (TODO, babyblueviper1) — NOT load-bearing yet. `capRoot` MUST equal the agreementHash
-    /// of an *accepted* ERC-8001 mandate the registrant can prove, bound to its ERC-8004 identity. This stub
-    /// is permissionless and takes the root ON FAITH — so anyone can `register(id, anyRoot)` and bounded
-    /// authority would be self-asserted, a hole in the no-trusted-party property at layer 1. Authenticating
-    /// the id<->capRoot binding to the 8001 acceptance is the layer-1 seam onto the witness; do not use as-is.
-    function register(bytes32 id, bytes32 capRoot) external {
+    /// LAYER-1 SEAM (closes issue #1). The registrant asserts NOTHING about its budget: `capRoot` is
+    /// pulled from an ERC-8001 agreement the agent *actually accepted*, and the registrant must be that
+    /// agent (ERC-8004-bound). So `capabilityRoot[id]` can only ever be authority the mandate granted —
+    /// never self-asserted. The 8001 registry is injected, so the acceptance check is itself recomputable
+    /// (no trusted issuer baked in). `id` stays the envelope handle; `agreementHash` names the mandate.
+    function register(bytes32 id, bytes32 agreementHash) external {
         if (capabilityRoot[id] != bytes32(0)) revert AlreadyRegistered();
-        capabilityRoot[id] = capRoot; // TODO(layer-1): require proof capRoot == accepted 8001 agreementHash (8004-bound)
+        (address agent, bytes32 capRoot) = agreements.acceptance(agreementHash);
+        if (agent == address(0)) revert AgreementNotAccepted();   // ERC-8001: mandate was never accepted
+        if (agent != msg.sender) revert NotMandateAgent();        // ERC-8004: caller is the accepting agent
+        if (capRoot == bytes32(0)) revert EmptyCapRoot();         // agreement must commit to a capability tree
+        capabilityRoot[id] = capRoot;                             // pulled from the accepted mandate, not asserted
+        emit Registered(id, agreementHash, capRoot, agent);
     }
 
     function advanceCursor(bytes32 id, bytes calldata witnessBytes) external override {

@@ -2,7 +2,7 @@
 pragma solidity ^0.8.24;
 
 import {Test} from "forge-std/Test.sol";
-import {HierarchicalBudgetPerLeaf, IReceiptVerifier} from "../src/HierarchicalBudgetPerLeaf.sol";
+import {HierarchicalBudgetPerLeaf, IReceiptVerifier, IAgreementRegistry} from "../src/HierarchicalBudgetPerLeaf.sol";
 
 // Mock ERC-8274 verifier: receiptProof = abi.encode(bool valid, bytes32 artifactHash).
 // (The real path — BIP340Verifier over a signed receipt — is proven in the recovery-escrow repo.)
@@ -10,6 +10,20 @@ contract MockVerifier is IReceiptVerifier {
     function verify(bytes32 expect, bytes calldata proof) external pure returns (bool, bool) {
         (bool v, bytes32 ah) = abi.decode(proof, (bool, bytes32));
         return (v, ah == expect);
+    }
+}
+
+// Mock ERC-8001 registry: an acceptance binds an agreementHash -> (accepting agent, committed capRoot).
+// (The real path is the ERC-8001 acceptance flow; injected so the check is recomputable, no baked issuer.)
+contract MockAgreements is IAgreementRegistry {
+    mapping(bytes32 => address) public agentOf;
+    mapping(bytes32 => bytes32) public capRootOf;
+    function setAcceptance(bytes32 agreementHash, address agent, bytes32 capRoot) external {
+        agentOf[agreementHash] = agent;
+        capRootOf[agreementHash] = capRoot;
+    }
+    function acceptance(bytes32 agreementHash) external view returns (address, bytes32) {
+        return (agentOf[agreementHash], capRootOf[agreementHash]);
     }
 }
 
@@ -22,13 +36,18 @@ contract HierarchicalBudgetPerLeafTest is Test {
     bytes32 leafA;
     bytes32 leafB;
     bytes32 root;
+    MockAgreements agreements;
+    bytes32 agreementHash = keccak256("agreement-1");
 
     function setUp() public {
-        bud = new HierarchicalBudgetPerLeaf(new MockVerifier());
+        agreements = new MockAgreements();
+        bud = new HierarchicalBudgetPerLeaf(new MockVerifier(), agreements);
         leafA = keccak256(abi.encode(scopeA, CAP, address(0)));
         leafB = keccak256(abi.encode(scopeB, CAP, address(0)));
         root = leafA <= leafB ? keccak256(abi.encodePacked(leafA, leafB)) : keccak256(abi.encodePacked(leafB, leafA));
-        bud.register(id, root);
+        // this test contract is the accepting agent; the agreement commits to `root`.
+        agreements.setAcceptance(agreementHash, address(this), root);
+        bud.register(id, agreementHash);
     }
 
     // build a valid witness for (scope, amount, receiptId)
@@ -89,5 +108,35 @@ contract HierarchicalBudgetPerLeafTest is Test {
     function test_neverOnValidAlone_invalidVerdict() public {
         vm.expectRevert(HierarchicalBudgetPerLeaf.WitnessInvalid.selector);
         bud.advanceCursor(id, _w(scopeA, 30, keccak256("r1"), false));
+    }
+
+    // --- layer-1 seam (issue #1): register() authenticates capRoot against the accepted 8001 mandate ---
+
+    // capRoot is pulled FROM the accepted agreement, never asserted by the caller.
+    function test_register_pullsCapRootFromAcceptedMandate() public {
+        assertEq(bud.capabilityRoot(id), root); // == the agreement's committed capRoot, set in setUp
+    }
+
+    // an unaccepted agreement can't be registered — kills the permissionless self-assertion hole.
+    function test_register_rejects_unacceptedMandate() public {
+        vm.expectRevert(HierarchicalBudgetPerLeaf.AgreementNotAccepted.selector);
+        bud.register(keccak256("job-2"), keccak256("never-accepted"));
+    }
+
+    // only the agent that accepted the mandate can register it (ERC-8004 binding).
+    function test_register_rejects_wrongAgent() public {
+        bytes32 ah = keccak256("agreement-2");
+        agreements.setAcceptance(ah, address(0xBEEF), root); // accepted by someone else
+        vm.expectRevert(HierarchicalBudgetPerLeaf.NotMandateAgent.selector);
+        bud.register(keccak256("job-2"), ah); // caller (this) != 0xBEEF
+    }
+
+    // a caller can't smuggle a bigger budget: the cap comes from the agreement, not the call.
+    function test_register_cannotAssertOwnCapRoot() public {
+        bytes32 ah = keccak256("agreement-3");
+        bytes32 realCap = keccak256("granted-small");
+        agreements.setAcceptance(ah, address(this), realCap);
+        bud.register(keccak256("job-3"), ah);
+        assertEq(bud.capabilityRoot(keccak256("job-3")), realCap); // the granted root, nothing the caller chose
     }
 }
