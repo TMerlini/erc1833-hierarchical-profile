@@ -26,6 +26,10 @@ pragma solidity ^0.8.24;
 /// `valid` alone, replay-nullified.
 
 interface IBoundedAgentAction {
+    /// BASE event — the cursor advancing against the envelope/bound. Surface-agnostic:
+    /// every profile (flat, per-chain, per-leaf) shares it. A profile MAY additionally
+    /// emit a more specific advance event (see `LeafAdvanced`); when it does, that event
+    /// refines this one and each profile-event implies an `EnvelopeAdvanced`.
     event EnvelopeAdvanced(bytes32 indexed id, bytes32 prevCursor, bytes32 newCursor);
     function getCursor(bytes32 id) external view returns (bytes32 cursorRoot);
     function advanceCursor(bytes32 id, bytes calldata witness) external;
@@ -58,6 +62,11 @@ contract HierarchicalBudgetPerLeaf is IBoundedAgentAction {
     mapping(bytes32 => mapping(bytes32 => uint256)) private _spent; // id => scopeId => spent  (PER-LEAF slots)
     mapping(bytes32 => bool) public nullified;                  // namespaced draw/settle keys
 
+    /// PER-LEAF PROFILE event — the same advance observed at leaf granularity, carrying the
+    /// `scopeId` (leaf identity) + per-leaf `newSpent`. Strictly more specific than the base
+    /// `EnvelopeAdvanced`, so it earns its own name; a `LeafAdvanced` IMPLIES an `EnvelopeAdvanced`
+    /// (both are emitted per draw). Consumption-criterion conformance for the per-leaf profile is
+    /// stated against THIS event; `leafSpent` is recomputable from its log.
     event LeafAdvanced(bytes32 indexed id, bytes32 indexed scopeId, uint256 newSpent, bytes32 receiptId, uint256 amount);
 
     error AlreadyRegistered();
